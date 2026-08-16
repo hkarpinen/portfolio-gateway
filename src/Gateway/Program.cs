@@ -1,3 +1,8 @@
+using System.Globalization;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.FileProviders;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -16,7 +21,7 @@ try
     // route table. The nested `ReverseProxy__Clusters__x__Destinations__primary__Address` form
     // works too, but nobody wants to type it into a compose file.
     builder.Configuration.AddInMemoryCollection(
-        GatewayRoutes.Services
+        GatewayRoutes.Clusters
             .Select(name => (name, url: builder.Configuration[$"SVC_{name.ToUpperInvariant()}_URL"]))
             .Where(x => !string.IsNullOrWhiteSpace(x.url))
             .ToDictionary(
@@ -27,16 +32,137 @@ try
         .AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
+    builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
     builder.Services.AddHealthChecks();
+
+    // Per client IP, which is the thing the services genuinely cannot do: their own
+    // AddFixedWindowLimiter policies have no partition key, so those are global buckets shared by
+    // every caller. These are the limits nginx used to hold.
+    builder.Services.AddRateLimiter(options =>
+    {
+        options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+        options.AddPolicy(GatewayRoutes.AuthLimiter, PartitionByClientIp(
+            builder.Configuration.GetValue<int?>("RateLimiting:auth") ?? 10));
+
+        options.AddPolicy(GatewayRoutes.ApiLimiter, PartitionByClientIp(
+            builder.Configuration.GetValue<int?>("RateLimiting:api") ?? 200));
+    });
+
+    builder.Services.Configure<ForwardedHeadersOptions>(options =>
+    {
+        options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+        options.KnownNetworks.Clear();
+        options.KnownProxies.Clear();
+    });
 
     var app = builder.Build();
 
+    app.UseForwardedHeaders();
     app.UseSerilogRequestLogging();
 
-    // The gateway routes; it does not authorise. Deciding here which paths tolerate an anonymous
-    // caller would mean holding a copy of every service's endpoint list, which is the duplication
-    // this project exists to remove. Each service already validates the token itself against
-    // identity's key set, and each owns the permissions only it can answer.
+    // Cleartext :80 exists for the ACME challenge and nothing else. certbot renews on a cron on
+    // the host and writes to the mounted volume; everything else is sent to HTTPS.
+    var acmeWebroot = app.Configuration["Acme:WebRoot"];
+    if (!string.IsNullOrWhiteSpace(acmeWebroot) && Directory.Exists(acmeWebroot))
+    {
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            RequestPath = "/.well-known/acme-challenge",
+            FileProvider = new PhysicalFileProvider(acmeWebroot),
+            ServeUnknownFileTypes = true,
+            DefaultContentType = "text/plain"
+        });
+    }
+
+    var canonicalHost = app.Configuration["CanonicalHost"];
+    // Traffic arriving here is in-cluster — the frontend's server-side fetches — and must never be
+    // redirected out to the public origin and back. Everything public arrives on :80 or :443.
+    var internalPort = app.Configuration.GetValue<int?>("InternalPort") ?? 8080;
+
+    if (!string.IsNullOrWhiteSpace(canonicalHost))
+    {
+        app.Use(async (context, next) =>
+        {
+            var isInternal = context.Connection.LocalPort == internalPort;
+            var isAcme = context.Request.Path.StartsWithSegments("/.well-known/acme-challenge");
+            var wrongHost = !string.Equals(context.Request.Host.Host, canonicalHost,
+                StringComparison.OrdinalIgnoreCase);
+
+            if (!isInternal && !isAcme && (!context.Request.IsHttps || wrongHost))
+            {
+                context.Response.Redirect(
+                    $"https://{canonicalHost}{context.Request.Path}{context.Request.QueryString}",
+                    permanent: true);
+                return;
+            }
+
+            await next();
+        });
+    }
+
+    app.Use(async (context, next) =>
+    {
+        var headers = context.Response.Headers;
+        // Inline scripts are Next's hydration; google.com/gstatic are reCAPTCHA v3; img-src is open
+        // because avatars are user-supplied URLs and the map tiles come from OSM.
+        headers["Content-Security-Policy"] =
+            "default-src 'self'; script-src 'self' 'unsafe-inline' https://www.google.com https://www.gstatic.com; " +
+            "style-src 'self' 'unsafe-inline'; img-src * data: blob:; connect-src 'self' https://www.google.com; " +
+            "frame-src https://www.google.com; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; " +
+            "form-action 'self'; object-src 'none';";
+        headers["X-Content-Type-Options"] = "nosniff";
+        headers["X-Frame-Options"] = "DENY";
+        headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+        if (context.Request.IsHttps)
+            headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload";
+
+        await next();
+    });
+
+    app.UseResponseCompression();
+
+    // The upload volumes, served straight off disk. Public by construction: there is no identity
+    // at this layer, which is why the keys are unguessable rather than access-controlled.
+    foreach (var (requestPath, configKey) in GatewayRoutes.UploadMounts)
+    {
+        var root = app.Configuration[configKey];
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            Log.Information("Uploads: {Path} not served — {Key} is {Root}", requestPath, configKey,
+                string.IsNullOrWhiteSpace(root) ? "unset" : $"'{root}' (missing)");
+            continue;
+        }
+
+        Log.Information("Uploads: serving {Path} from {Root}", requestPath, root);
+
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            RequestPath = requestPath,
+            FileProvider = new PhysicalFileProvider(root),
+            OnPrepareResponse = ctx =>
+            {
+                var headers = ctx.Context.Response.Headers;
+                headers.CacheControl = "public, max-age=3600";
+                headers.ContentDisposition = "inline";
+                headers["X-Frame-Options"] = "SAMEORIGIN";
+            }
+        });
+    }
+
+    // Explicit, and deliberately after the static files above. StaticFileMiddleware stands aside
+    // whenever an endpoint has already been selected — and the frontend catch-all route matches
+    // every path, so letting routing run first sends every avatar through Next instead of off
+    // disk. Calling UseRouting here also suppresses the copy WebApplication would otherwise
+    // insert at the top of the pipeline.
+    app.UseRouting();
+
+    app.UseRateLimiter();
+
+    // Routes and nothing else. Deciding here which paths tolerate an anonymous caller would mean
+    // holding a copy of every service's endpoint list, which is the duplication this project
+    // exists to remove. Each service validates the token itself against identity's key set, and
+    // each owns the permissions only it can answer.
     app.MapReverseProxy();
     app.MapHealthChecks("/healthz");
 
@@ -51,9 +177,29 @@ finally
     Log.CloseAndFlush();
 }
 
+static Func<HttpContext, RateLimitPartition<string>> PartitionByClientIp(int permitPerMinute) =>
+    context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = permitPerMinute,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0
+        });
+
 internal static class GatewayRoutes
 {
+    public const string AuthLimiter = "auth";
+    public const string ApiLimiter = "api";
+
     /// <summary>Cluster ids, which double as the <c>SVC_&lt;NAME&gt;_URL</c> suffixes.</summary>
-    public static readonly string[] Services =
-        ["identity", "forum", "finance", "notifications", "household", "math", "geography"];
+    public static readonly string[] Clusters =
+        ["identity", "forum", "finance", "notifications", "household", "math", "geography", "frontend"];
+
+    /// <summary>Public path → the config key holding the directory behind it.</summary>
+    public static readonly (string RequestPath, string ConfigKey)[] UploadMounts =
+    [
+        ("/uploads/avatars", "Uploads:Avatars"),
+        ("/uploads/forum", "Uploads:Forum")
+    ];
 }

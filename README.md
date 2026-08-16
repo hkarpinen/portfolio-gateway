@@ -15,9 +15,20 @@ copy of every service's endpoint list — the same duplication this project exis
 service validates the token itself against identity's key set, and each owns the permissions only
 it can answer: forum reads `CommunityMembership.Role`, household reads its memberships.
 
-It does not terminate TLS. nginx still does that, along with ACME and the `/uploads/*` volumes, and
-it hands `/api/*` here and everything else straight to the frontend — so page and asset traffic
-never takes a hop through .NET.
+## What replaced nginx
+
+This is the whole edge now. Alongside routing it does TLS, serves the ACME challenge, redirects to
+the canonical HTTPS host, sets the security headers, serves the two upload volumes off disk, and
+rate limits per client IP — that last one being the thing the services genuinely cannot do, since
+their own limiter policies have no partition key and are therefore global buckets.
+
+certbot still renews on a host cron. It writes to the same paths; its deploy hook restarts this
+container instead of reloading nginx.
+
+One ordering trap worth knowing: `UseStaticFiles` stands aside whenever routing has already
+selected an endpoint, and the frontend catch-all route matches every path. `UseRouting` is
+therefore called explicitly, after the static file middleware. Move it and every avatar quietly
+starts being served through Next instead of off disk.
 
 ## Pointing a service somewhere else
 
