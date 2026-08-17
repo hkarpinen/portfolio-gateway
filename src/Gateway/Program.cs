@@ -208,7 +208,7 @@ internal static class GatewayRoutes
 
     /// <summary>Cluster ids, which double as the <c>SVC_&lt;NAME&gt;_URL</c> suffixes.</summary>
     public static readonly string[] Clusters =
-        ["identity", "forum", "finance", "notifications", "household", "math", "geography", "frontend"];
+        ["identity", "forum", "finance", "notifications", "household", "math", "geography", "media", "frontend"];
 
     /// <summary>Public path → the config key holding the directory behind it.</summary>
     public static readonly (string RequestPath, string ConfigKey)[] UploadMounts =
