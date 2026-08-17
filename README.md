@@ -3,27 +3,23 @@
 The system's public API surface. Everything under `/api/*` reaches a backend through here, for
 every client — the web frontend today, a mobile app later.
 
-`src/Gateway/appsettings.json` holds **the** route table. It used to exist in four places
-(`infra/nginx.conf.template`, a dead `infra/nginx.conf`, `e2e/local-prod/nginx.conf`, and the dev
-rewrites in `frontend/next.config.mjs`), which is how it drifted: the e2e copy never grew the SSE
-handling the production one had.
+`src/Gateway/appsettings.json` holds the route table.
 
 ## What this is not
 
-It does not authorise. Deciding here which paths tolerate an anonymous caller would mean holding a
-copy of every service's endpoint list — the same duplication this project exists to remove. Each
-service validates the token itself against identity's key set, and each owns the permissions only
-it can answer: forum reads `CommunityMembership.Role`, household reads its memberships.
+It does not authorise. That would mean holding a copy of every service's endpoint list. Each
+service validates the token against identity's key set and owns the permissions only it can
+answer: forum reads `CommunityMembership.Role`, household reads its memberships.
 
-## What replaced nginx
+## What it does
 
-This is the whole edge now. Alongside routing it does TLS, serves the ACME challenge, redirects to
+This is the edge. Alongside routing it does TLS, serves the ACME challenge, redirects to
 the canonical HTTPS host, sets the security headers, serves the two upload volumes off disk, and
 rate limits per client IP — that last one being the thing the services genuinely cannot do, since
 their own limiter policies have no partition key and are therefore global buckets.
 
-certbot still renews on a host cron. It writes to the same paths; its deploy hook restarts this
-container instead of reloading nginx.
+certbot renews on a host cron and writes the certificate files; its deploy hook restarts this
+container.
 
 One ordering trap worth knowing: `UseStaticFiles` stands aside whenever routing has already
 selected an endpoint, and the frontend catch-all route matches every path. `UseRouting` is
@@ -44,9 +40,7 @@ The names are `SVC_IDENTITY_URL`, `SVC_FORUM_URL`, `SVC_FINANCE_URL`, `SVC_NOTIF
 `/api/households` while the service and variable are singular.
 
 A service that is not running answers 502 on its own routes and nothing else — the gateway resolves
-destinations per request, so it starts fine against a partial stack. That is the difference from
-nginx, which resolves every `upstream` at startup and refuses to boot with
-`host not found in upstream` if one hostname is missing.
+destinations per request, so it starts fine against a partial stack. 
 
 So running a subset is just running a subset:
 

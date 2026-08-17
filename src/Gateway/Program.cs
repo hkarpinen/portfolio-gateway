@@ -16,10 +16,8 @@ try
     builder.Host.UseSerilog((context, configuration) =>
         configuration.ReadFrom.Configuration(context.Configuration));
 
-    // Destinations come from one env var per service so a single backend can be pointed somewhere
-    // else — at a container, at a process running from source on the host — without touching the
-    // route table. The nested `ReverseProxy__Clusters__x__Destinations__primary__Address` form
-    // works too, but nobody wants to type it into a compose file.
+    // One env var per service, so a backend can be pointed at a process running from source
+    // without touching the route table.
     builder.Configuration.AddInMemoryCollection(
         GatewayRoutes.Clusters
             .Select(name => (name, url: builder.Configuration[$"SVC_{name.ToUpperInvariant()}_URL"]))
@@ -28,10 +26,9 @@ try
                 x => $"ReverseProxy:Clusters:{x.name}:Destinations:primary:Address",
                 x => x.url));
 
-    // Binding is configured here rather than through Kestrel__Endpoints__* or ASPNETCORE_URLS,
-    // because compose merges environment maps and cannot delete a key the base file set: a dev
-    // run would inherit production's HTTPS endpoint and its certificate path, and Kestrel loads
-    // the certificate eagerly — failing to start over a file that only exists on the VPS.
+    // Binding lives here rather than in Kestrel config so that an absent Tls path means no HTTPS
+    // endpoint at all. Kestrel loads a configured certificate eagerly and fails to start if the
+    // file is missing, which is not what an environment without certs wants.
     var httpPort = builder.Configuration.GetValue<int?>("Gateway:HttpPort") ?? 8080;
     var internalPort = builder.Configuration.GetValue<int?>("Gateway:InternalPort");
     var certPath = builder.Configuration["Tls:CertPath"];
@@ -58,9 +55,8 @@ try
     builder.Services.AddResponseCompression(options => options.EnableForHttps = true);
     builder.Services.AddHealthChecks();
 
-    // Per client IP, which is the thing the services genuinely cannot do: their own
-    // AddFixedWindowLimiter policies have no partition key, so those are global buckets shared by
-    // every caller. These are the limits nginx used to hold.
+    // Partitioned by client IP. The services' own limiter policies have no partition key, so
+    // theirs are global buckets shared by every caller.
     builder.Services.AddRateLimiter(options =>
     {
         options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -84,8 +80,7 @@ try
     app.UseForwardedHeaders();
     app.UseSerilogRequestLogging();
 
-    // Cleartext :80 exists for the ACME challenge and nothing else. certbot renews on a cron on
-    // the host and writes to the mounted volume; everything else is sent to HTTPS.
+    // certbot renews on a host cron and writes the challenge here.
     var acmeWebroot = app.Configuration["Acme:WebRoot"];
     if (!string.IsNullOrWhiteSpace(acmeWebroot) && Directory.Exists(acmeWebroot))
     {
@@ -145,8 +140,8 @@ try
 
     app.UseResponseCompression();
 
-    // The upload volumes, served straight off disk. Public by construction: there is no identity
-    // at this layer, which is why the keys are unguessable rather than access-controlled.
+    // Public by construction — there is no identity at this layer, which is why upload keys are
+    // unguessable rather than access-controlled.
     foreach (var (requestPath, configKey) in GatewayRoutes.UploadMounts)
     {
         var root = app.Configuration[configKey];
@@ -173,19 +168,15 @@ try
         });
     }
 
-    // Explicit, and deliberately after the static files above. StaticFileMiddleware stands aside
-    // whenever an endpoint has already been selected — and the frontend catch-all route matches
-    // every path, so letting routing run first sends every avatar through Next instead of off
-    // disk. Calling UseRouting here also suppresses the copy WebApplication would otherwise
-    // insert at the top of the pipeline.
+    // Must stay after the static files. StaticFileMiddleware stands aside once an endpoint is
+    // selected, and the frontend catch-all matches every path — routing first means every avatar
+    // is proxied to Next rather than served off disk.
     app.UseRouting();
 
     app.UseRateLimiter();
 
-    // Routes and nothing else. Deciding here which paths tolerate an anonymous caller would mean
-    // holding a copy of every service's endpoint list, which is the duplication this project
-    // exists to remove. Each service validates the token itself against identity's key set, and
-    // each owns the permissions only it can answer.
+    // Routing only. Each service validates the token against identity's key set and owns the
+    // permissions only it can answer.
     app.MapReverseProxy();
     app.MapHealthChecks("/healthz");
 
