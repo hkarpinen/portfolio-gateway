@@ -51,7 +51,7 @@ nginx, which resolves every `upstream` at startup and refuses to boot with
 So running a subset is just running a subset:
 
 ```bash
-docker compose -f compose.dev.yaml up -d postgres rabbitmq identity finance gateway
+docker compose -f compose.yaml -f compose.dev.yaml up -d postgres rabbitmq identity finance gateway
 ```
 
 Requests to `/api/forum/*` return 502; everything else works.

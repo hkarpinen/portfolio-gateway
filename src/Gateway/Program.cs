@@ -1,4 +1,4 @@
-using System.Globalization;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
@@ -27,6 +27,29 @@ try
             .ToDictionary(
                 x => $"ReverseProxy:Clusters:{x.name}:Destinations:primary:Address",
                 x => x.url));
+
+    // Binding is configured here rather than through Kestrel__Endpoints__* or ASPNETCORE_URLS,
+    // because compose merges environment maps and cannot delete a key the base file set: a dev
+    // run would inherit production's HTTPS endpoint and its certificate path, and Kestrel loads
+    // the certificate eagerly — failing to start over a file that only exists on the VPS.
+    var httpPort = builder.Configuration.GetValue<int?>("Gateway:HttpPort") ?? 8080;
+    var internalPort = builder.Configuration.GetValue<int?>("Gateway:InternalPort");
+    var certPath = builder.Configuration["Tls:CertPath"];
+    var keyPath = builder.Configuration["Tls:KeyPath"];
+
+    builder.WebHost.ConfigureKestrel(options =>
+    {
+        options.ListenAnyIP(httpPort);
+
+        if (internalPort is int p && p != httpPort)
+            options.ListenAnyIP(p);
+
+        if (!string.IsNullOrWhiteSpace(certPath) && !string.IsNullOrWhiteSpace(keyPath))
+        {
+            var certificate = X509Certificate2.CreateFromPemFile(certPath, keyPath);
+            options.ListenAnyIP(443, listen => listen.UseHttps(certificate));
+        }
+    });
 
     builder.Services
         .AddReverseProxy()
@@ -78,13 +101,13 @@ try
     var canonicalHost = app.Configuration["CanonicalHost"];
     // Traffic arriving here is in-cluster — the frontend's server-side fetches — and must never be
     // redirected out to the public origin and back. Everything public arrives on :80 or :443.
-    var internalPort = app.Configuration.GetValue<int?>("InternalPort") ?? 8080;
+    var internalPortForRedirects = internalPort ?? httpPort;
 
     if (!string.IsNullOrWhiteSpace(canonicalHost))
     {
         app.Use(async (context, next) =>
         {
-            var isInternal = context.Connection.LocalPort == internalPort;
+            var isInternal = context.Connection.LocalPort == internalPortForRedirects;
             var isAcme = context.Request.Path.StartsWithSegments("/.well-known/acme-challenge");
             var wrongHost = !string.Equals(context.Request.Host.Host, canonicalHost,
                 StringComparison.OrdinalIgnoreCase);
