@@ -62,10 +62,10 @@ try
         options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
         options.AddPolicy(GatewayRoutes.AuthLimiter, PartitionByClientIp(
-            builder.Configuration.GetValue<int?>("RateLimiting:auth") ?? 10));
+            builder.Configuration.GetValue<int?>("RateLimiting:auth") ?? 10, internalPort));
 
         options.AddPolicy(GatewayRoutes.ApiLimiter, PartitionByClientIp(
-            builder.Configuration.GetValue<int?>("RateLimiting:api") ?? 200));
+            builder.Configuration.GetValue<int?>("RateLimiting:api") ?? 200, internalPort));
     });
 
     builder.Services.Configure<ForwardedHeadersOptions>(options =>
@@ -191,15 +191,24 @@ finally
     Log.CloseAndFlush();
 }
 
-static Func<HttpContext, RateLimitPartition<string>> PartitionByClientIp(int permitPerMinute) =>
-    context => RateLimitPartition.GetFixedWindowLimiter(
-        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-        _ => new FixedWindowRateLimiterOptions
-        {
-            PermitLimit = permitPerMinute,
-            Window = TimeSpan.FromMinutes(1),
-            QueueLimit = 0
-        });
+/// <summary>
+/// Limits public traffic per client address. Requests arriving on the internal port are exempt:
+/// they come from the frontend's server-side rendering, which shares one container address, so a
+/// per-address bucket would be one budget for the entire user base — and /api/identity/me renders
+/// on every page.
+/// </summary>
+static Func<HttpContext, RateLimitPartition<string>> PartitionByClientIp(
+    int permitPerMinute, int? internalPort) =>
+    context => internalPort is int port && context.Connection.LocalPort == port
+        ? RateLimitPartition.GetNoLimiter("internal")
+        : RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = permitPerMinute,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            });
 
 internal static class GatewayRoutes
 {
