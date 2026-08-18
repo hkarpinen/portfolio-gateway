@@ -20,5 +20,5 @@ jobs:
           key: ${{ secrets.DEPLOY_KEY }}
           script: |
             cd ${{ secrets.DEPLOY_PATH }}
-            docker compose -f compose.yaml -f compose.prod.yaml pull gateway
-            docker compose -f compose.yaml -f compose.prod.yaml up -d --no-deps --force-recreate gateway
+            docker compose pull gateway
+            docker compose up -d --no-deps --force-recreate gateway
